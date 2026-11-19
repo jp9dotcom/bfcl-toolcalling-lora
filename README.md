@@ -653,6 +653,6 @@ When analyzing failures, inspect the raw response and identify whether the model
 
 ## License
 
-This repository is released under the [MIT License](LICENSE).
+This repository is released under the [MIT License](LICENSE).© 2026 jp9dotcom
 
 The repository license applies to this repository's code and documentation. It does not automatically grant rights to redistribute external datasets, model weights, or third-party dependencies. Review their respective licenses and terms before use.
