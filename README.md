@@ -17,6 +17,7 @@ The repository includes BFCL baseline workflows, a data-preparation pipeline usi
 - [Data preparation](#data-preparation)
 - [Prompt and output format](#prompt-and-output-format)
 - [Models and inference](#models-and-inference)
+- [LoRA and QLoRA: technical foundations](#lora-and-qlora-technical-foundations)
 - [BFCL baseline evaluation](#bfcl-baseline-evaluation)
 - [Diagnostic probe evaluation](#diagnostic-probe-evaluation)
 - [Setup](#setup)
@@ -243,6 +244,186 @@ The `qwen-lora.ipynb` notebook demonstrates bitsandbytes 4-bit loading with:
 A recorded Kaggle session used two NVIDIA T4 GPUs but explicitly placed the model on GPU 0. The notebook recorded approximately 2.68 GB of GPU memory allocated after loading Qwen3-4B-Instruct-2507 in 4-bit mode in that session.
 
 **Scope clarification:** this notebook currently demonstrates quantized loading and inference examples. It does not include the adapter configuration, trainer, training loop, or adapter-save steps required to reproduce LoRA fine-tuning.
+
+## LoRA and QLoRA: technical foundations
+
+This section explains the parameter-efficient fine-tuning method that motivates the repository. The equations below describe the standard LoRA/QLoRA formulation; they are **methodological background**, not a claim that the current notebook has trained an adapter. The checked-in `qwen-lora.ipynb` currently performs quantized model loading and inference only.
+
+### 1. Why parameter-efficient fine-tuning?
+
+A transformer contains large weight matrices learned during pretraining. Full fine-tuning updates every parameter, which can require substantial GPU memory for:
+
+- The base model weights.
+- Gradients for trainable parameters.
+- Optimizer states (for example, first and second moments in AdamW).
+- Activations retained for backpropagation.
+
+LoRA (Low-Rank Adaptation) reduces the number of trainable parameters by freezing the pretrained weights and learning a low-rank update to selected linear layers.
+
+Let a pretrained linear layer have weight matrix:
+
+`W_0 \in \mathbb{R}^{d_{out}\times d_{in}}`.
+
+For an input activation `x`, the original layer computes:
+
+`h = W_0 x`.
+
+Full fine-tuning learns a dense update `\Delta W`:
+
+`h = (W_0 + \Delta W)x`.
+
+LoRA instead constrains the update to a low-rank factorization:
+
+`\Delta W = BA`
+
+where:
+
+- `A \in \mathbb{R}^{r\times d_{in}}`
+- `B \in \mathbb{R}^{d_{out}\times r}`
+- `r` is the adapter rank, typically much smaller than `d_{in}` and `d_{out}`.
+
+The forward pass becomes:
+
+`h = W_0x + BAx`.
+
+The base matrix `W_0` is frozen. Only `A` and `B` are optimized. A common LoRA implementation scales the adapter update by `\alpha/r`:
+
+`h = W_0x + \frac{\alpha}{r}BAx`.
+
+Here, `\alpha` controls the contribution of the adapter and `r` controls the rank/capacity of the update. Some implementations use alternative rank scaling; the exact convention should be recorded with the experiment.
+
+### 2. Why does low rank save parameters?
+
+A dense update to a layer with dimensions `d_{out}\times d_{in}` requires:
+
+`N_{dense}=d_{out}d_{in}`
+
+trainable parameters.
+
+The LoRA factors require:
+
+`N_{LoRA}=rd_{in}+d_{out}r=r(d_{in}+d_{out})`.
+
+For an illustrative square projection of size `4096\times4096` with rank `r=16`:
+
+| Approach | Trainable parameters |
+|---|---:|
+| Dense weight update | 16,777,216 |
+| LoRA factors | 131,072 |
+
+That is approximately **0.78%** as many trainable parameters for this one projection. This is an illustrative calculation, not a measurement of the exact Qwen layers or adapter configuration in this repository.
+
+The savings become substantial when adapters are applied across many transformer projections. The trade-off is that a low-rank update has less freedom than an unrestricted dense update. A larger rank increases adapter capacity and trainable parameters; a smaller rank is cheaper but may underfit the task.
+
+### 3. Where are LoRA adapters applied?
+
+In transformer language models, LoRA is commonly attached to selected linear projections inside attention and/or the feed-forward network.
+
+For an attention block, the projections typically include:
+
+- Query projection (`W_q`)
+- Key projection (`W_k`)
+- Value projection (`W_v`)
+- Attention output projection (`W_o`)
+
+Some recipes also target MLP projections. The choice of target modules changes both the number of trainable parameters and the adaptation capacity.
+
+For tool calling, adapting attention projections can help the model attend to the user request, available tool descriptions, parameter schemas, and relevant context when producing a structured call. This is a motivation, not a guarantee: the model still needs representative training examples and a consistent output format.
+
+**Important:** the current repository does not record a verified LoRA target-module list, rank, alpha, dropout, or trained adapter checkpoint. Those values must be selected, implemented, and reported when the training stage is added.
+
+### 4. What is QLoRA?
+
+QLoRA combines a frozen, quantized base model with trainable LoRA adapters. Instead of storing the full base weights in 16-bit precision, the base weights are stored in a lower-bit representation and dequantized as needed for computation.
+
+Conceptually, the layer is:
+
+`h = \operatorname{dequant}(Q(W_0))x + \frac{\alpha}{r}BAx`.
+
+Where:
+
+- `Q(W_0)` is the quantized representation of the frozen pretrained weights.
+- `\operatorname{dequant}` maps the quantized weights to the compute representation for the forward operation.
+- `A` and `B` remain trainable adapter matrices.
+
+The common QLoRA recipe uses:
+
+- **4-bit NormalFloat (NF4):** a 4-bit data type designed for representing normally distributed neural-network weights.
+- **Double quantization:** quantizes the quantization constants as well, reducing additional memory overhead.
+- **Paged optimizers:** help manage optimizer memory spikes in supported training setups.
+- **Low-rank adapters:** only adapter parameters receive gradient updates; the quantized base weights remain frozen.
+
+Quantization reduces base-weight memory, but it does not eliminate activation memory, optimizer memory for adapters, or all runtime overhead. Actual memory use depends on model size, context length, batch size, attention implementation, and training configuration.
+
+### 5. What the current notebook actually configures
+
+The checked-in `qwen-lora.ipynb` demonstrates the following 4-bit loading configuration for `Qwen/Qwen3-4B-Instruct-2507`:
+
+| Setting | Notebook configuration |
+|---|---|
+| Quantization | 4-bit |
+| Quantization type | NF4 |
+| Double quantization | Enabled |
+| Compute dtype | FP16 |
+| Device placement | GPU 0 |
+| Attention implementation | SDPA |
+
+This is the quantized **inference/model-loading** portion of a potential QLoRA workflow. It is not evidence of adapter training. In particular, the current notebook does not provide a complete `LoraConfig`, optimizer, trainer, loss computation, training loop, or adapter export.
+
+### 6. Supervised fine-tuning objective for tool calling
+
+Once a LoRA trainer is implemented, the prepared prompt/completion records can be used for supervised fine-tuning (SFT).
+
+Let:
+
+- `x` be the prompt containing the user request and available tool schemas.
+- `y=(y_1,\ldots,y_T)` be the target assistant completion.
+- `\theta` be the frozen base-model parameters.
+- `\phi` be the trainable LoRA parameters.
+
+The model learns to maximize the likelihood of the target completion conditioned on the prompt:
+
+`P_{\theta,\phi}(y\mid x)=\prod_{t=1}^{T}P_{\theta,\phi}(y_t\mid x,y_{<t})`.
+
+The standard token-level negative log-likelihood objective is:
+
+`\mathcal{L}_{SFT}(\phi)=-\sum_{t=1}^{T}\log P_{\theta,\phi}(y_t\mid x,y_{<t})`.
+
+Across a dataset of examples, the training objective averages or sums this loss over the target tokens and examples. If the implementation uses completion-only loss, prompt tokens are masked from the loss; whether that masking is applied must be explicitly verified in the trainer configuration.
+
+For this project, target completions should represent all three decision types:
+
+1. **Call:** a correctly formatted `<tool_call>` with the expected function name and arguments.
+2. **Ask:** a natural-language clarification request when required arguments are absent.
+3. **Abstain:** a natural-language response when no available tool can perform the task.
+
+This is important because training only on successful tool calls can teach the model to call too aggressively. The ask and abstain examples teach the decision boundary around tool use.
+
+### 7. How LoRA parameters are optimized
+
+During backpropagation, gradients are computed for the adapter factors while the pretrained model weights remain frozen:
+
+`\nabla_{W_0}\mathcal{L}=0,\qquad \nabla_A\mathcal{L}\ne0,\qquad \nabla_B\mathcal{L}\ne0`.
+
+An optimizer such as AdamW updates the adapter parameters. The exact optimizer, learning rate, schedule, batch size, gradient accumulation, warmup, epochs, and checkpoint-selection criterion should be included in a future run manifest. They are not specified as completed training settings in the current repository.
+
+### 8. How to evaluate whether the adapter helped
+
+A valid before/after comparison should keep the benchmark version, test categories, prompt template, decoding parameters, and evaluation implementation fixed.
+
+At minimum, compare:
+
+- BFCL overall and category-level accuracy.
+- Tool/function selection correctness.
+- Argument-name and argument-value correctness.
+- Multi-call and parallel-call behaviour.
+- Irrelevance / unsupported-request handling.
+- Missing-argument clarification behaviour.
+- Invalid or fabricated tool-call frequency.
+
+The 45-case probe suite is useful for targeted call/ask/abstain diagnostics, but it is not a substitute for BFCL's official scoring. Results should be reported separately.
+
+---
 
 ## BFCL baseline evaluation
 
